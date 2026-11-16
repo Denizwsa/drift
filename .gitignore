@@ -1,0 +1,8 @@
+/target
+client/target
+extracted/
+core-extracted/
+web.*.js
+frames.jsonl
+*.jsonl
+.env
