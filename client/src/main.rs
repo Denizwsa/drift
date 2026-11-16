@@ -23,6 +23,7 @@ const CHAT_BG: Color32 = Color32::from_rgb(0x31, 0x33, 0x38);
 const USER_PANEL_BG: Color32 = Color32::from_rgb(0x23, 0x24, 0x28);
 const BLURPLE: Color32 = Color32::from_rgb(0x58, 0x65, 0xf2);
 const TEXT: Color32 = Color32::from_rgb(0xdb, 0xde, 0xe1);
+const TEXT_BRIGHT: Color32 = Color32::from_rgb(0xf2, 0xf3, 0xf5);
 const TEXT_MUTE: Color32 = Color32::from_rgb(0x94, 0x9b, 0xa4);
 const ROW_HOVER: Color32 = Color32::from_rgb(0x35, 0x37, 0x3c);
 const ROW_SELECTED: Color32 = Color32::from_rgb(0x40, 0x42, 0x49);
@@ -114,6 +115,189 @@ fn ping_wav() -> Vec<u8> {
 }
 
 
+
+#[derive(Clone)]
+enum MsgPart {
+    Text(String),
+    Mention(String),
+    Everyone,
+    CustomEmoji { name: String, id: String, animated: bool },
+}
+
+fn parse_message(content: &str) -> Vec<MsgPart> {
+    fn take_tag<'a>(s: &'a str, i: usize) -> Option<(&'a str, &'a str, usize)> {
+        // assumes content[i..] starts with '<'
+        let rest = &s[i..];
+        let end = rest.find('>')?;
+        let inner = &rest[1..end];
+        Some((&rest[..=end], inner, end + 1))
+    }
+    let mut parts = Vec::new();
+    let mut buf = String::new();
+    let bytes = content.as_bytes();
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i < n {
+        if content.is_char_boundary(i) && content[i..].starts_with("<@") {
+            if let Some((_, inner, adv)) = take_tag(content, i) {
+                let id = inner.trim_start_matches('!');
+                if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+                    if !buf.is_empty() { parts.push(MsgPart::Text(std::mem::take(&mut buf))); }
+                    parts.push(MsgPart::Mention(id.to_string()));
+                    i += adv;
+                    continue;
+                }
+            }
+        }
+        if content.is_char_boundary(i) && (content[i..].starts_with("<:") || content[i..].starts_with("<a:")) {
+            if let Some((_, inner, adv)) = take_tag(content, i) {
+                let animated = content[i..].starts_with("<a:");
+                let body = inner.trim_start_matches('a').trim_start_matches(':');
+                if let Some((name, id)) = body.rsplit_once(':') {
+                    if !name.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+                        if !buf.is_empty() { parts.push(MsgPart::Text(std::mem::take(&mut buf))); }
+                        parts.push(MsgPart::CustomEmoji { name: name.to_string(), id: id.to_string(), animated });
+                        i += adv;
+                        continue;
+                    }
+                }
+            }
+        }
+        if content.is_char_boundary(i) && content[i..].starts_with("@everyone") {
+            if !buf.is_empty() { parts.push(MsgPart::Text(std::mem::take(&mut buf))); }
+            parts.push(MsgPart::Everyone);
+            i += 9;
+            continue;
+        }
+        if content.is_char_boundary(i) && content[i..].starts_with("@here") {
+            if !buf.is_empty() { parts.push(MsgPart::Text(std::mem::take(&mut buf))); }
+            parts.push(MsgPart::Everyone);
+            i += 5;
+            continue;
+        }
+        // push next utf8 char
+        let ch_len = utf8_len(bytes[i]);
+        buf.push_str(&content[i..i + ch_len]);
+        i += ch_len;
+    }
+    if !buf.is_empty() { parts.push(MsgPart::Text(buf)); }
+    parts
+}
+
+const UNICODE_EMOJIS: &[&str] = &[
+    "😀","😂","🤣","🥰","😍","🤔","😅","🙃","😘","🙂","🙄","😭","😤","😏","😢","🤯","😎","🥺","🥹","🤩",
+    "😴","🫠","🤤","🤐","🥴","🤢","🤠","🥳","😷","🤓","😛","😜","🤪","😝","🫡","🥱","😈","👻","💀","💩",
+    "🤡","💔","❤️","🔥","💯","💢","🎉","✨","🎯","🏖️","🎂","🏆","🙌","👏","🙏","👍","👎","💪","🤝","✌️",
+    "🤟","👊","🤛","🤜","🫰","🫶","💥","⭐","🌟","🌙","☀️","🌈","⚡","❄️","🌊","💧","🔥","💣","⚔️","💎","👑",
+];
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 { 1 } else if b >> 5 == 0b110 { 2 } else if b >> 4 == 0b1110 { 3 } else { 4 }
+}
+
+
+fn gif_grid_cell(
+    ui: &mut egui::Ui,
+    gifs: &mut HashMap<String, GifState>,
+    favorites: &mut Vec<crate::api::GifItem>,
+    g: &crate::api::GifItem,
+) -> Option<CellAction> {
+    let cell_size = egui::vec2(108.0, 84.0);
+    let (rect, resp) = ui.allocate_exact_size(cell_size, egui::Sense::click());
+    if !gifs.contains_key(&g.preview) {
+        gifs.insert(g.preview.clone(), GifState::Loading);
+    }
+    // trigger fetch happens in the caller (needs ctx/tx) — draw placeholder state
+    if let Some(GifState::Ready(entry)) = gifs.get(&g.preview) {
+        if let Some((tex, _)) = entry.frames.first() {
+            let img_size = tex.size_vec2();
+            let scale = (cell_size.x / img_size.x).min(cell_size.y / img_size.y).min(1.0);
+            let target = img_size * scale;
+            let r = egui::Rect::from_center_size(rect.center(), target);
+            ui.painter_at(rect).image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+    } else {
+        ui.painter_at(rect).rect_filled(rect, 6.0, ROW_SELECTED);
+    }
+    // star toggle (top-right)
+    let star_rect = egui::Rect::from_min_max(rect.max - egui::vec2(24.0, 24.0), rect.max);
+    let star_resp = ui.interact(star_rect, egui::Id::new(("gif_star", &g.id)), egui::Sense::click());
+    let is_fav = favorites.iter().any(|f| f.id == g.id);
+    let star = if is_fav { "⭐" } else { "☆" };
+    ui.painter_at(rect).text(star_rect.center(), egui::Align2::CENTER_CENTER, star, egui::FontId::proportional(15.0), Color32::from_rgba_unmultiplied(255, 224, 0, 220));
+    if star_resp.clicked() {
+        if is_fav {
+            favorites.retain(|f| f.id != g.id);
+        } else {
+            favorites.push(g.clone());
+        }
+        return Some(CellAction::Fav(g.clone()));
+    }
+    if resp.clicked() {
+        return Some(CellAction::Send(g.clone()));
+    }
+    None
+}
+
+/// Discord-ish primary button: filled blurple with soft outer glow.
+fn primary_button(ui: &mut egui::Ui, text: impl Into<String>, min: Option<egui::Vec2>) -> egui::Response {
+    let mut btn = egui::Button::new(
+        RichText::new(text.into()).color(Color32::WHITE).strong().size(15.0),
+    )
+    .fill(BLURPLE);
+    if let Some(m) = min {
+        btn = btn.min_size(m);
+    }
+    ui.add(btn)
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).clamp(0.0, 255.0) as u8
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    Color32::from_rgb(
+        lerp_u8(a.r(), b.r(), t),
+        lerp_u8(a.g(), b.g(), t),
+        lerp_u8(a.b(), b.b(), t),
+    )
+}
+
+/// Discord-style guild rail button with squircle morph on hover.
+fn rail_button(ui: &mut egui::Ui, id: egui::Id, selected: bool, icon: impl ToString, hint: &str) -> egui::Response {
+    let size = egui::vec2(46.0, 46.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hovered = resp.hovered();
+    let t = ui.ctx().animate_bool_with_time(id, hovered, 0.12);
+    let rounding = egui::lerp(26.0..=13.5, t);
+    let fill = if selected {
+        BLURPLE
+    } else {
+        lerp_color(Color32::from_rgb(0x36, 0x39, 0x3f), Color32::from_rgb(0x46, 0x49, 0x52), t)
+    };
+    ui.painter_at(rect).rect_filled(rect, rounding, fill);
+    // white selection bar on the left edge, alpha grows with selection
+    if selected {
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x - 14.0, rect.center().y - 14.0),
+            egui::pos2(rect.min.x - 10.0, rect.center().y + 14.0),
+        );
+        ui.painter_at(bar).rect_filled(bar, 3.0, Color32::WHITE);
+    }
+    ui.painter_at(rect).text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon.to_string(),
+        egui::FontId::proportional(20.0),
+        Color32::WHITE,
+    );
+    resp.on_hover_text(hint)
+}
+
+fn role_color(u: u32) -> Color32 {
+    Color32::from_rgb(((u >> 16) & 0xFF) as u8, ((u >> 8) & 0xFF) as u8, (u & 0xFF) as u8)
+}
+
 fn draw_media(ui: &mut egui::Ui, gifs: &mut HashMap<String, GifState>, url: &str, tx: &std::sync::mpsc::Sender<UiEvent>, ctx: &egui::Context, max_w: f32) {
     if !gifs.contains_key(url) {
         gifs.insert(url.to_string(), GifState::Loading);
@@ -153,6 +337,14 @@ fn sys_lang() -> &'static str {
         }
     }
     "en"
+}
+
+fn load_favorites() -> Vec<crate::api::GifItem> {
+    dirs::config_dir()
+        .map(|d| d.join("discord-rust").join("favorites.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn main() -> eframe::Result<()> {
@@ -222,7 +414,36 @@ struct App {
     output_stream: Option<rodio::OutputStream>,
     output_handle: Option<rodio::OutputStreamHandle>,
     settings_tab: SettingsTab,
+    gif_modal: bool,
+    gif_query: String,
+    gif_results: Option<Vec<crate::api::GifItem>>,
+    gif_loading: bool,
+    gif_error: Option<String>,
+    gif_previews: HashMap<String, egui::TextureHandle>,
+    emoji_textures: HashMap<String, egui::TextureHandle>,
+    emoji_modal: bool,
+    reaction_target: Option<String>, // Some(message_id) => picker applies a reaction
+    usernames: HashMap<String, String>,
+    unread_mentions: HashMap<String, u32>,
+    typing: HashMap<String, Vec<(String, std::time::Instant)>>,
+    guild_members: HashMap<String, Vec<crate::models::GuildMember>>,
+    guild_roles: HashMap<String, Vec<crate::models::Role>>,
+    guild_emojis: HashMap<String, Vec<crate::models::Emoji>>,
+    dm_filter: String,
+    emoji_tab: u8,
+    call_mode: bool,
+    call_fullscreen: bool,
+    call_started: Option<std::time::Instant>,
+    local_speaking: bool,
+    remote_speaking: std::collections::HashSet<u32>,
+    remote_speaking_at: HashMap<u32, std::time::Instant>,
+    ssrc_to_user: HashMap<u32, String>,
+    presence_last_sent: Option<std::time::Instant>,
+    favorites: Vec<crate::api::GifItem>,
+    gif_tab: u8, // 0: search/trending, 1: favorites
 }
+
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
@@ -256,6 +477,11 @@ fn badges(flags: u64) -> Vec<&'static str> {
         (1 << 18, "Moderator Program Alumni"),
     ];
     FLAGS.iter().filter(|(bit, _)| flags & bit != 0).map(|(_, n)| *n).collect()
+}
+
+enum CellAction {
+    Send(crate::api::GifItem),
+    Fav(crate::api::GifItem),
 }
 
 struct StreamEntry {
@@ -346,6 +572,33 @@ impl App {
             output_stream: out_stream,
             output_handle: out_handle,
             settings_tab: SettingsTab::Gorunum,
+            gif_modal: false,
+            gif_query: String::new(),
+            gif_results: None,
+            gif_loading: false,
+            gif_error: None,
+            gif_previews: HashMap::new(),
+            emoji_textures: HashMap::new(),
+            emoji_modal: false,
+            reaction_target: None,
+            usernames: HashMap::new(),
+            unread_mentions: HashMap::new(),
+            typing: HashMap::new(),
+            guild_members: HashMap::new(),
+            guild_roles: HashMap::new(),
+            guild_emojis: HashMap::new(),
+            dm_filter: String::new(),
+            emoji_tab: 0,
+            call_mode: false,
+            call_fullscreen: false,
+            call_started: None,
+            local_speaking: false,
+            remote_speaking: std::collections::HashSet::new(),
+            remote_speaking_at: HashMap::new(),
+            ssrc_to_user: HashMap::new(),
+            presence_last_sent: None,
+            favorites: load_favorites(),
+            gif_tab: 0,
         };
         if let Some(tok) = token {
             if let Ok(api) = RestClient::new(tok.clone()) {
@@ -439,6 +692,25 @@ impl App {
         }
     }
 
+    fn save_favorites(&self) {
+        if let Some(dir) = dirs::config_dir().map(|d| d.join("discord-rust")) {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(
+                dir.join("favorites.json"),
+                serde_json::to_string(&self.favorites).unwrap_or_default(),
+            );
+        }
+    }
+
+    fn toggle_favorite(&mut self, gif: &crate::api::GifItem) {
+        if let Some(pos) = self.favorites.iter().position(|f| f.id == gif.id) {
+            self.favorites.remove(pos);
+        } else {
+            self.favorites.push(gif.clone());
+        }
+        self.save_favorites();
+    }
+
     fn set_presence(&mut self, p: Presence) {
         self.presence = p;
         let payload = serde_json::json!({
@@ -449,6 +721,129 @@ impl App {
             let _ = s.send(payload.to_string());
         }
         self.status = format!("Durum güncellendi: {}", p.label());
+    }
+
+    fn render_call_panel(&mut self, ui: &mut egui::Ui, ctx: egui::Context) {
+        let sel_ch = self.selected_channel.clone();
+        let channel_name = self
+            .channels
+            .iter()
+            .find(|c| Some(&c.id) == sel_ch.as_ref())
+            .map(|c| c.display_name())
+            .unwrap_or_else(|| "Sesli Arama".into());
+        let elapsed = self.call_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        let mm = elapsed / 60;
+        let ss = elapsed % 60;
+
+        ui.vertical_centered(|ui| {
+            ui.add_space(22.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📞").size(26.0));
+                ui.heading(RichText::new(&channel_name).size(20.0).color(Color32::WHITE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(format!("{mm:02}:{ss:02}")).size(15.0).monospace().color(TEXT_MUTE));
+                });
+            });
+            ui.label(RichText::new("Sesli aramada").color(GREEN));
+            ui.add_space(26.0);
+
+            // participant tiles
+            let own_id = self.user.as_ref().map(|u| u.id.clone());
+            let mut tiles: Vec<(String, Option<String>)> = Vec::new(); // (id, name)
+            if let Some(own) = &own_id {
+                tiles.push((own.clone(), Some(self.user.as_ref().map(|u| u.display_name()).unwrap_or_default())));
+            }
+            if let Some(cid) = &sel_ch {
+                if let Some(c) = self.channels.iter().find(|c| &c.id == cid) {
+                    for r in &c.recipients {
+                        if Some(&r.id) == own_id.as_ref() {
+                            continue;
+                        }
+                        tiles.push((r.id.clone(), Some(r.global_name.clone().unwrap_or_else(|| r.username.clone()))));
+                    }
+                }
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                for (uid, name) in &tiles {
+                    let is_me = own_id.as_deref() == Some(uid.as_str());
+                    let mut speaking = if is_me { self.local_speaking } else { false };
+                    if !is_me {
+                        // match remote ssrc to this user id when we have a mapping; otherwise fall back to "any remote speaking" for 1:1 DMs
+                        speaking = self.ssrc_to_user.iter().any(|(ssrc, u)| u == uid && self.remote_speaking.contains(ssrc))
+                            || (tiles.len() == 2 && !self.remote_speaking.is_empty());
+                    }
+                    ui.vertical(|ui| {
+                        ui.set_min_width(120.0);
+                        let size = 108.0_f32;
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+                        let rounding = 20.0_f32;
+                        let painter = ui.painter_at(rect);
+                        // big avatar with rounded frame
+                        match self.author_avatars.get(uid) {
+                            Some(tex) => {
+                                painter.rect_filled(rect, rounding, BLURPLE);
+                                let inner = rect.shrink(5.0);
+                                painter.image(tex.id(), inner, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                            }
+                            None => {
+                                painter.rect_filled(rect, rounding, lerp_color(BLURPLE, RAIL_BG, 0.4));
+                                let initial = name.as_ref().map(|n| n.chars().next().unwrap_or('?').to_uppercase().collect::<String>()).unwrap_or_else(|| "?".to_string());
+                                painter.text(rect.center(), egui::Align2::CENTER_CENTER, initial, egui::FontId::proportional(44.0), Color32::WHITE);
+                            }
+                        }
+                        if speaking {
+                            painter.circle_stroke(rect.center(), size / 2.0 + 3.5, egui::Stroke::new(5.0, GREEN));
+                        }
+                        if resp.clicked() {
+                            self.call_fullscreen = !self.call_fullscreen;
+                        }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(name.as_deref().unwrap_or("?")).strong().color(Color32::WHITE));
+                        if speaking {
+                            ui.label(RichText::new("konuşuyor…").small().color(GREEN));
+                        } else if is_me && self.self_mute {
+                            ui.label(RichText::new("mikrofon kapalı").small().color(RED));
+                        } else {
+                            ui.label(RichText::new(if is_me { "sen" } else { "beklemede" }).small().color(TEXT_MUTE));
+                        }
+                    });
+                }
+            });
+
+            ui.add_space(30.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new(if self.self_mute { "🔇" } else { "🎙" }).size(22.0)).min_size(egui::vec2(62.0, 62.0))).on_hover_text("Mikrofon sustur / aç").clicked() {
+                    self.toggle_self_mute();
+                }
+                if ui.add(egui::Button::new(RichText::new("📵").size(22.0).color(Color32::WHITE)).fill(RED).min_size(egui::vec2(72.0, 62.0))).on_hover_text("Aramayı bitir").clicked() {
+                    if let Some(ch) = self.voice_connected.clone() {
+                        self.toggle_voice(self.selected_guild.clone(), &ch);
+                    }
+                }
+                if ui.add(egui::Button::new(RichText::new(if self.self_deafen { "🎧❌" } else { "🎧" }).size(22.0)).min_size(egui::vec2(62.0, 62.0))).on_hover_text("Kulaklık sustur / aç").clicked() {
+                    self.self_deafen = !self.self_deafen;
+                }
+                if ui.add(egui::Button::new(RichText::new(if self.call_fullscreen { "⛶" } else { "⛶" }).size(20.0)).min_size(egui::vec2(62.0, 62.0))).on_hover_text("Tam ekran / çık").clicked() {
+                    self.call_fullscreen = !self.call_fullscreen;
+                }
+            });
+            ui.add_space(18.0);
+        });
+    }
+
+    fn toggle_self_mute(&mut self) {
+        self.self_mute = !self.self_mute;
+        if let Some(s) = &self.voice_tx {
+            if let Some(ch) = &self.voice_connected {
+                let gid = self.voice_guild.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
+                let payload = serde_json::json!({
+                    "op": 4,
+                    "d": { "guild_id": gid, "channel_id": ch, "self_mute": self.self_mute, "self_deaf": self.self_deafen }
+                });
+                let _ = s.send(payload.to_string());
+            }
+        }
     }
 
     fn spawn_gateway_session(&mut self, token: String, ctx: &egui::Context) {
@@ -483,11 +878,87 @@ impl App {
         if leaving {
             self.voice_connected = None;
             self.voice_guild = None;
+            self.call_mode = false;
+            self.call_fullscreen = false;
+            self.call_started = None;
             self.status = "Ses: çıkıldı".into();
         } else {
             self.voice_connected = Some(channel_id.to_string());
             self.voice_guild = guild_id.clone();
+            self.call_mode = true;
+            self.call_started = Some(std::time::Instant::now());
             self.status = "Ses: katılım isteği gönderildi — voice handshake başlıyor…".into();
+        }
+    }
+
+    fn render_gif_grid(&mut self, ui: &mut egui::Ui, results: &[crate::api::GifItem], ctx: &egui::Context) {
+        for chunk in results.chunks(4) {
+            ui.horizontal(|ui| {
+                for g in chunk {
+                    if !self.gifs.contains_key(&g.preview) {
+                        self.gifs.insert(g.preview.clone(), GifState::Loading);
+                        events::gif_fetch(g.preview.clone(), self.tx.clone(), ctx.clone());
+                    }
+                    match gif_grid_cell(ui, &mut self.gifs, &mut self.favorites, g) {
+                        Some(CellAction::Send(gif)) => {
+                            if let (Some(cid), Some(tok)) = (self.selected_channel.clone(), self.token.clone()) {
+                                if let Ok(api) = RestClient::new(tok) {
+                                    events::send_message(api, cid, gif.gif_src, self.tx.clone(), ctx.clone());
+                                }
+                            }
+                            self.gif_modal = false;
+                        }
+                        Some(CellAction::Fav(_)) => {
+                            self.save_favorites();
+                        }
+                        None => {}
+                    }
+                }
+            });
+        }
+    }
+
+    fn toggle_reaction(&mut self, message_id: &str, emoji: &crate::models::ReactionEmoji) {
+        let Some(tok) = self.token.clone() else { return };
+        let Some(cid) = self.selected_channel.clone() else { return };
+        let existing = self
+            .messages
+            .iter()
+            .find(|m| m.id == message_id)
+            .and_then(|m| m.reactions.iter().find(|r| r.emoji.name == emoji.name && r.emoji.id == emoji.id))
+            .map(|r| r.me);
+        let add = !existing.unwrap_or(false);
+        let key = match &emoji.id {
+            Some(id) => format!("{}:{}", emoji.name, id),
+            None => emoji.name.clone(),
+        };
+        let mid = message_id.to_string();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = RestClient::new(tok).and_then(|api| {
+                if add {
+                    api.add_reaction(&cid, &mid, &key)
+                } else {
+                    api.remove_reaction(&cid, &mid, &key)
+                }
+            });
+            if let Err(e) = result {
+                let _ = tx.send(UiEvent::ApiError(format!("tepki: {e}")));
+            }
+        });
+    }
+
+    fn apply_emoji_pick(&mut self, name: String, id: Option<String>, animated: bool) {
+        if let Some(mid) = self.reaction_target.clone() {
+            let emoji = crate::models::ReactionEmoji { name, id, animated };
+            self.toggle_reaction(&mid, &emoji);
+            self.reaction_target = None;
+            self.emoji_modal = false;
+            return;
+        }
+        match id {
+            Some(id) => self.message_input.push_str(&format!("<{}:{name}:{id}>", if animated { "a:" } else { ":" })),
+            None => self.message_input.push_str(&name),
         }
     }
 
@@ -553,6 +1024,9 @@ impl App {
                         self.messages = messages;
                     }
                     for m in &self.messages {
+                        self.usernames.insert(m.author.id.clone(), m.author.display_name());
+                    }
+                    for m in &self.messages {
                         let id = m.author.id.clone();
                         if self.author_avatars.contains_key(&id) || !self.avatar_pending.insert(id.clone()) {
                             continue;
@@ -605,11 +1079,23 @@ impl App {
                     }
                 }
                 UiEvent::LiveMessage { channel_id, message } => {
+                    self.usernames.insert(message.author.id.clone(), message.author.display_name());
                     let from_me = self.user.as_ref().map(|u| u.id == message.author.id).unwrap_or(false);
                     if Some(&channel_id) == self.selected_channel.as_ref()
                         && !self.messages.iter().any(|m| m.id == message.id)
                     {
                         self.messages.push(message.clone());
+                    }
+                    if !from_me && Some(&channel_id) != self.selected_channel.as_ref() {
+                        let my_id = self.user.as_ref().map(|u| u.id.as_str());
+                        let content = message.content.to_lowercase();
+                        let mention = match my_id {
+                            Some(id) => content.contains(&format!("<@{id}>")) || content.contains(&format!("<@!{id}>")),
+                            None => false,
+                        };
+                        if mention || content.contains("@everyone") || content.contains("@here") {
+                            *self.unread_mentions.entry(channel_id.clone()).or_insert(0) += 1;
+                        }
                     }
                     if self.sound_on && !from_me {
                         self.ping();
@@ -727,6 +1213,99 @@ impl App {
                     let total_ms: u32 = texs.iter().map(|(_, d)| *d).sum::<u32>().max(1);
                     self.gifs.insert(url, GifState::Ready(GifEntry { frames: texs, total_ms, started: std::time::Instant::now() }));
                 }
+                UiEvent::ReactionEvent { channel_id, message_id, user_id, emoji_name, emoji_id, add } => {
+                    if Some(&channel_id) == self.selected_channel.as_ref() {
+                        let my_id = self.user.as_ref().map(|u| u.id.clone());
+                        if let Some(m) = self.messages.iter_mut().find(|m| m.id == message_id) {
+                            let mut found = false;
+                            for r in &mut m.reactions {
+                                if r.emoji.name == emoji_name && r.emoji.id == emoji_id {
+                                    found = true;
+                                    if add {
+                                        r.count = r.count.saturating_add(1);
+                                    } else {
+                                        r.count = r.count.saturating_sub(1);
+                                    }
+                                    if my_id.as_deref() == Some(user_id.as_str()) {
+                                        r.me = add;
+                                    }
+                                }
+                            }
+                            m.reactions.retain(|r| r.count > 0);
+                            if add && !found {
+                                m.reactions.push(crate::models::Reaction {
+                                    emoji: crate::models::ReactionEmoji { name: emoji_name.clone(), id: emoji_id.clone(), animated: false },
+                                    count: 1,
+                                    me: my_id.as_deref() == Some(user_id.as_str()),
+                                });
+                            }
+                        }
+                    }
+                }
+                UiEvent::TypingStart { channel_id, user_id } => {
+                    let entry = self.typing.entry(channel_id).or_default();
+                    if !entry.iter().any(|(u, _)| u == &user_id) {
+                        entry.push((user_id, std::time::Instant::now()));
+                    }
+                }
+                UiEvent::GifResults { results, query } => {
+                    self.gif_loading = false;
+                    self.gif_error = None;
+                    self.gif_results = Some(results);
+                    self.gif_query = query;
+                }
+                UiEvent::GifSearchFailed { error } => {
+                    self.gif_loading = false;
+                    self.gif_error = Some(error);
+                }
+                UiEvent::EmojiTexture { id, bytes } => {
+                    if let Ok(img) = image::load_from_memory(&bytes) {
+                        let rgba = img.into_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let tex = ctx.load_texture(
+                            format!("emoji-{id}"),
+                            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+                            Default::default(),
+                        );
+                        self.emoji_textures.insert(id, tex);
+                    }
+                }
+                UiEvent::GuildData { guild_id, members, roles, emojis } => {
+                    for m in &members {
+                        self.usernames.insert(m.user.id.clone(), m.user.display_name());
+                    }
+                    if let Some(tok) = self.token.clone() {
+                        for m in members.iter().take(400) {
+                            if let Some(av) = m.user.avatar.clone() {
+                                if !self.author_avatars.contains_key(&m.user.id) && !self.avatar_pending.contains(&m.user.id) {
+                                    self.avatar_pending.insert(m.user.id.clone());
+                                    events::avatar_fetch(tok.clone(), m.user.id.clone(), av, self.tx.clone(), ctx.clone());
+                                }
+                            }
+                        }
+                    }
+                    self.guild_members.insert(guild_id.clone(), members);
+                    self.guild_roles.insert(guild_id.clone(), roles);
+                    self.guild_emojis.insert(guild_id.clone(), emojis);
+                }
+                UiEvent::SpeakingLocal { speaking } => {
+                    self.local_speaking = speaking;
+                }
+                UiEvent::SpeakingRemote { ssrc, speaking } => {
+                    if speaking {
+                        self.remote_speaking.insert(ssrc);
+                        self.remote_speaking_at.insert(ssrc, std::time::Instant::now());
+                    } else {
+                        self.remote_speaking.remove(&ssrc);
+                    }
+                }
+                UiEvent::VoiceClients { ids } => {
+                    // currently logged-only; used by group call speaker attribution later
+                    eprintln!("voice clients: {:?}", ids);
+                }
+                UiEvent::VoiceSsrcMap { user_id, ssrc } => {
+                    self.ssrc_to_user.insert(ssrc, user_id);
+                }
                 UiEvent::GifFailed { url } => {
                     self.gifs.insert(url, GifState::Failed);
                 }
@@ -740,6 +1319,25 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
+        // expire remote-speaking flags after 2s of silence
+        let now_inst = std::time::Instant::now();
+        self.remote_speaking_at.retain(|_, t| now_inst.duration_since(*t) < Duration::from_millis(2000));
+        self.remote_speaking = self.remote_speaking_at.keys().copied().collect();
+
+        // resend presence periodically so it doesn't get clobbered by other clients
+        if self.token.is_some() {
+            let due = self.presence_last_sent.map(|t| t.elapsed() > Duration::from_secs(30)).unwrap_or(true);
+            if due {
+                self.presence_last_sent = Some(std::time::Instant::now());
+                let payload = serde_json::json!({
+                    "op": 3,
+                    "d": { "since": null, "activities": [], "status": self.presence.wire(), "afk": false }
+                });
+                if let Some(txr) = &self.voice_tx {
+                    let _ = txr.send(payload.to_string());
+                }
+            }
+        }
         // drag-and-drop anywhere on the window = attach
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
@@ -1115,6 +1713,157 @@ impl eframe::App for App {
                     });
                 });
         }
+
+        // --- EMOJI PICKER MODAL
+        if self.emoji_modal {
+            egui::Window::new(RichText::new("Emoji").strong())
+                .collapsible(false)
+                .default_size([420.0, 330.0])
+                .frame(Frame::new().fill(CHANNELS_BG).inner_margin(12.0).corner_radius(12.0).stroke(Stroke::new(1.0, RAIL_BG)))
+                .show(&ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.emoji_tab, 0u8, "😀 Unicode");
+                        ui.selectable_value(&mut self.emoji_tab, 1u8, "🧩 Sunucu");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").on_hover_text("Kapat").clicked() {
+                                self.emoji_modal = false;
+                                self.reaction_target = None;
+                            }
+                        });
+                    });
+                    if self.reaction_target.is_some() {
+                        ui.label(RichText::new("Tepkiyi seç — mesajına eklenir").small().color(TEXT_MUTE));
+                    }
+                    ui.separator();
+                    ScrollArea::vertical().show(ui, |ui| {
+                        if self.emoji_tab == 0 {
+                            ui.horizontal_wrapped(|ui| {
+                                for e in UNICODE_EMOJIS {
+                                    if ui.add(egui::Button::new(RichText::new(*e).size(20.0)).min_size(egui::vec2(40.0, 36.0))).clicked() {
+                                        self.apply_emoji_pick(e.to_string(), None, false);
+                                    }
+                                }
+                            });
+                        } else {
+                            let gid = self.selected_guild.clone();
+                            let emojis = gid.as_deref().and_then(|g| self.guild_emojis.get(g)).cloned().unwrap_or_default();
+                            if emojis.is_empty() {
+                                ui.label(RichText::new("Bu sunucuda custom emoji yok (veya hâlâ çekiliyor).").small().color(TEXT_MUTE));
+                            } else {
+                                ui.horizontal_wrapped(|ui| {
+                                    for e in emojis {
+                                        let tex = self.emoji_textures.get(&e.id).cloned();
+                                        if tex.is_none() {
+                                            events::emoji_fetch(e.id.clone(), e.animated, self.tx.clone(), ctx.clone());
+                                        }
+                                        let resp = if let Some(t) = tex {
+                                            ui.add(egui::Button::image(egui::Image::new(&t).max_width(34.0).max_height(34.0)))
+                                        } else {
+                                            ui.add(egui::Button::new(RichText::new(format!(":{}:", e.name)).small()))
+                                        };
+                                        if resp.on_hover_text(format!(":{}:", e.name)).clicked() {
+                                            self.apply_emoji_pick(e.name.clone(), Some(e.id.clone()), e.animated);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                });
+        }
+
+        // --- GIF PICKER MODAL
+        if self.gif_modal {
+            // auto-fetch trending when opened empty
+            if self.gif_results.is_none() && self.gif_query.trim().is_empty() && !self.gif_loading {
+                self.gif_loading = true;
+                if let Some(tok) = self.token.clone() {
+                    events::trending_gifs(tok, self.tx.clone(), ctx.clone());
+                }
+            }
+            egui::Window::new(RichText::new("GIF Gönder").strong())
+                .collapsible(false)
+                .default_size([480.0, 420.0])
+                .frame(Frame::new().fill(CHANNELS_BG).inner_margin(12.0).corner_radius(12.0).stroke(Stroke::new(1.0, RAIL_BG)))
+                .show(&ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.gif_tab, 0u8, "🔍 Ara & Popüler");
+                        ui.selectable_value(&mut self.gif_tab, 1u8, format!("⭐ Favoriler ({})", self.favorites.len()));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").on_hover_text("Kapat").clicked() {
+                                self.gif_modal = false;
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    if self.gif_tab == 0 {
+                        ui.horizontal(|ui| {
+                            egui::Frame::new().fill(CHAT_BG).inner_margin(egui::Margin::symmetric(10, 4)).corner_radius(14.0).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("🔍");
+                                    let te = ui.add(TextEdit::singleline(&mut self.gif_query).hint_text("GIF ara…").desired_width(280.0));
+                                    if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        self.gif_loading = true;
+                                        if let Some(tok) = self.token.clone() {
+                                            events::gif_search(tok, self.gif_query.clone(), self.tx.clone(), ctx.clone());
+                                        }
+                                    }
+                                });
+                            });
+                            if ui.button("Ara").clicked() {
+                                self.gif_loading = true;
+                                if let Some(tok) = self.token.clone() {
+                                    events::gif_search(tok, self.gif_query.clone(), self.tx.clone(), ctx.clone());
+                                }
+                            }
+                        });
+                        if let Some(err) = &self.gif_error {
+                            ui.label(RichText::new(format!("GIF yüklenemedi: {err}")).small().color(RED));
+                        }
+                        ui.separator();
+                        ScrollArea::vertical().show(ui, |ui| {
+                            if self.gif_loading {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Klipy'de aranıyor…");
+                                });
+                                return;
+                            }
+                            let results: Vec<crate::api::GifItem> = self.gif_results.clone().unwrap_or_default();
+                            if results.is_empty() {
+                                ui.label("Aramak için yaz ve Enter'a bas. Sonuç yoksa kelime değiştir.");
+                                return;
+                            }
+                            self.render_gif_grid(ui, &results, &ctx);
+                        });
+                    } else {
+                        ScrollArea::vertical().show(ui, |ui| {
+                            let favorites = self.favorites.clone();
+                            if favorites.is_empty() {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(26.0);
+                                    ui.label(RichText::new("⭐").size(34.0));
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new("Henüz favori GIF yok").color(TEXT));
+                                    ui.label(RichText::new("Arama sekmesinde ☆'ya basarak ekle").small().color(TEXT_MUTE));
+                                });
+                                return;
+                            }
+                            self.render_gif_grid(ui, &favorites, &ctx);
+                        });
+                    }
+                });
+        }
+
+
+        if self.call_mode && self.call_fullscreen {
+            egui::CentralPanel::default().show(ui, |ui| {
+                self.render_call_panel(ui, ui.ctx().clone());
+            });
+            return;
+        }
+
         // --- GUILD RAIL (leftmost)
         egui::Panel::left("guild-rail")
             .frame(Frame::new().fill(RAIL_BG))
@@ -1131,10 +1880,7 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 // Home (DMs)
                 let home_selected = self.selected_guild.as_deref() == Some("@me");
-                let home = egui::Button::new(RichText::new("💬").size(20.0))
-                    .fill(if home_selected { BLURPLE } else { ROW_SELECTED })
-                    .min_size(egui::vec2(44.0, 44.0));
-                if ui.add(home).on_hover_text("Direk Mesajlar").clicked() {
+                if rail_button(ui, ui.make_persistent_id("rail_home"), home_selected, "💬", "Direk Mesajlar").clicked() {
                     self.selected_guild = Some("@me".into());
                     self.selected_is_dm = true;
                     self.channels = self.dm_channels.clone();
@@ -1146,24 +1892,44 @@ impl eframe::App for App {
                 ScrollArea::vertical().show(ui, |ui| {
                     for g in &self.guilds.clone() {
                         let selected = self.selected_guild.as_deref() == Some(g.id.as_str());
-                        let fill = if selected { BLURPLE } else { ROW_SELECTED };
-                        let btn = if let Some(tex) = self.guild_icons.get(&g.id) {
-                            egui::Button::image(egui::Image::new(tex).max_height(44.0).max_width(44.0))
-                                .fill(fill)
-                                .min_size(egui::vec2(44.0, 44.0))
+                        let id = ui.make_persistent_id(("guild", &g.id));
+                        if self.guild_icons.contains_key(&g.id) {
+                            // image texture: render manually for squircle clip
+                            let tex = self.guild_icons.get(&g.id).unwrap();
+                            let size = egui::vec2(46.0, 46.0);
+                            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                            let hovered = resp.hovered();
+                            let t = ctx.animate_bool_with_time(id.with("h"), hovered, 0.12);
+                            let rounding = egui::lerp(26.0..=13.5, t);
+                            let fill = if selected { BLURPLE } else { lerp_color(Color32::from_rgb(0x36, 0x39, 0x3f), Color32::from_rgb(0x46, 0x49, 0x52), t) };
+                            ui.painter_at(rect).rect_filled(rect, rounding, fill);
+                            let img_rect = rect.shrink(3.0);
+                            ui.painter_at(rect).image(tex.id(), img_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                            if resp.on_hover_text(&g.name).clicked() {
+                                self.selected_guild = Some(g.id.clone());
+                                self.selected_is_dm = false;
+                                self.selected_channel = None;
+                                self.messages.clear();
+                                self.load_channels_for(&ctx, g.id.clone());
+                                if let Some(tok) = self.token.clone() {
+                                    events::guild_data_fetch(tok, g.id.clone(), self.tx.clone(), ctx.clone());
+                                }
+                            }
                         } else {
-                            egui::Button::new(RichText::new(&g.name.chars().take(2).collect::<String>().to_uppercase()).size(16.0).strong())
-                                .fill(fill)
-                                .min_size(egui::vec2(44.0, 44.0))
-                        };
-                        if ui.add(btn).on_hover_text(&g.name).clicked() {
-                            self.selected_guild = Some(g.id.clone());
-                            self.selected_is_dm = false;
-                            self.selected_channel = None;
-                            self.messages.clear();
-                            self.load_channels_for(&ctx, g.id.clone());
+                            // initials morph
+                            let txt = g.name.chars().take(2).collect::<String>().to_uppercase();
+                            if rail_button(ui, id.with("t"), selected, txt, &g.name).clicked() {
+                                self.selected_guild = Some(g.id.clone());
+                                self.selected_is_dm = false;
+                                self.selected_channel = None;
+                                self.messages.clear();
+                                self.load_channels_for(&ctx, g.id.clone());
+                                if let Some(tok) = self.token.clone() {
+                                    events::guild_data_fetch(tok, g.id.clone(), self.tx.clone(), ctx.clone());
+                                }
+                            }
                         }
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
                     }
                 });
             });
@@ -1183,16 +1949,26 @@ impl eframe::App for App {
             };
             ui.heading(RichText::new(title).size(15.0).strong().color(TEXT));
             ui.separator();
-            let vh = ui.available_height();
-            ScrollArea::vertical().id_salt("ch-list").max_height((vh - 62.0).max(0.0)).show(ui, |ui| {
-                for c in self.channels.clone() {
+            if self.selected_is_dm {
+                ui.add(TextEdit::singleline(&mut self.dm_filter).hint_text("🔍 DM'lerde ara…").desired_width(ui.available_width()));
+                ui.add_space(4.0);
+            }
+            let mut visible: Vec<Channel> = self.channels.clone();
+            if self.selected_is_dm && !self.dm_filter.trim().is_empty() {
+                let q = self.dm_filter.trim().to_lowercase();
+                visible.retain(|c| c.display_name().to_lowercase().contains(&q));
+            }
+            ScrollArea::vertical().id_salt("ch-list").max_height((ui.available_height() - 62.0).max(0.0)).show(ui, |ui| {
+                for c in visible {
                     if c.kind == Channel::CATEGORY {
                         ui.add_space(8.0);
-                        ui.label(RichText::new(c.display_name().to_uppercase()).small().strong().color(TEXT_MUTE));
+                        ui.label(RichText::new(c.display_name().to_uppercase()).small().strong().color(TEXT));
                         continue;
                     }
                     let selected = self.selected_channel.as_deref() == Some(c.id.as_str());
-                    let icon = if c.is_voice() { "🔊" } else { "#" };
+                    let icon = if c.is_voice() {
+                        if self.voice_connected.as_deref() == Some(c.id.as_str()) { "🎙" } else { "🔊" }
+                    } else { "#" };
                     ui.horizontal(|ui| {
                         // DM/group rows show the peer's avatar instead of an icon
                         if c.is_dm() {
@@ -1213,8 +1989,14 @@ impl eframe::App for App {
                             selected,
                             RichText::new(label)
                                 .size(self.font_size)
-                                .color(if selected { Color32::WHITE } else { TEXT_MUTE }),
+                                .color(if selected { Color32::WHITE } else { TEXT }),
                         );
+                        if let Some(cnt) = self.unread_mentions.get(&c.id) {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(17.0, 17.0), egui::Sense::hover());
+                            let painter = ui.painter_at(rect);
+                            painter.circle_filled(rect.center(), 8.5, RED);
+                            painter.text(rect.center(), egui::Align2::CENTER_CENTER, cnt.to_string(), egui::FontId::proportional(10.5), Color32::WHITE);
+                        }
                         if self.streams.contains_key(&c.id) {
                             let watched = self.watching_channel.as_deref() == Some(c.id.as_str());
                             if ui.small_button(if watched { "📺■" } else { "📺" }).clicked() {
@@ -1224,6 +2006,7 @@ impl eframe::App for App {
                         }
                         if resp.clicked() {
                             self.selected_channel = Some(c.id.clone());
+                            self.unread_mentions.remove(&c.id);
                             self.messages.clear();
                             self.load_messages_for(&ctx, c.id.clone());
                             if c.is_voice() {
@@ -1268,17 +2051,7 @@ impl eframe::App for App {
                             }
                             let mic_btn = if self.self_mute { "🔇" } else { "🎙" };
                             if ui.button(mic_btn).on_hover_text("Mikrofon sustur / aç").clicked() {
-                                self.self_mute = !self.self_mute;
-                                if let Some(s) = &self.voice_tx {
-                                    if let Some(ch) = &self.voice_connected {
-                                        let gid = self.voice_guild.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
-                                        let payload = serde_json::json!({
-                                            "op": 4,
-                                            "d": { "guild_id": gid, "channel_id": ch, "self_mute": self.self_mute, "self_deaf": self.self_deafen }
-                                        });
-                                        let _ = s.send(payload.to_string());
-                                    }
-                                }
+                                self.toggle_self_mute();
                             }
                         });
                     }
@@ -1315,6 +2088,10 @@ impl eframe::App for App {
 
         // --- MESSAGE AREA
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.call_mode {
+                self.render_call_panel(ui, ctx.clone());
+                return;
+            }
             if let Some(cid) = self.watching_channel.clone() {
                 if let Some(entry) = self.streams.get(&cid) {
                     ui.horizontal(|ui| {
@@ -1346,6 +2123,14 @@ impl eframe::App for App {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.selected_is_dm {
+                        let in_call = self.call_mode && self.voice_connected.is_some();
+                        if ui.add(egui::Button::new(if in_call { "📞✅" } else { "📞" })).on_hover_text(if in_call { "Aramayı bitir" } else { "Sesli arama" }).clicked() {
+                            if let Some(cid) = self.selected_channel.clone() {
+                                self.toggle_voice(self.selected_guild.clone(), &cid);
+                            }
+                        }
+                    }
                     if is_group && ui.button("👥 Üyeler").clicked() {
                         self.show_members = !self.show_members;
                     }
@@ -1365,16 +2150,17 @@ impl eframe::App for App {
             let avail = ui.available_size();
             let searching = !self.search.trim().is_empty();
             let search_l = self.search.trim().to_lowercase();
-            let filtered: Vec<&Message> = self
+            let filtered: Vec<Message> = self
                 .messages
                 .iter()
                 .filter(|m| search_l.is_empty() || m.content.to_lowercase().contains(&search_l))
+                .cloned()
                 .collect();
             ScrollArea::vertical()
                 .stick_to_bottom(!searching)
                 .max_height((avail.y - input_height - 12.0).max(0.0))
                 .show(ui, |ui| {
-                    for m in &filtered {
+                    for m in filtered {
                         ui.horizontal(|ui| {
                             let ac = author_color(&m.author.id);
                             match self.author_avatars.get(&m.author.id) {
@@ -1413,8 +2199,46 @@ impl eframe::App for App {
                                     if m.edited_timestamp.is_some() {
                                         ui.label(RichText::new("düzenlendi").small().color(TEXT_MUTE));
                                     }
+                                    if ui.small_button("🙂+").on_hover_text("Tepki ekle").clicked() {
+                                        self.reaction_target = Some(m.id.clone());
+                                        self.emoji_modal = true;
+                                    }
                                 });
-                                ui.label(RichText::new(&m.content).size(self.font_size).color(TEXT));
+                                let parts = parse_message(&m.content);
+                                ui.horizontal_wrapped(|ui| {
+                                for part in &parts {
+                                    match part {
+                                        MsgPart::Text(t) => {
+                                            ui.label(RichText::new(t).size(self.font_size).color(TEXT));
+                                        }
+                                        MsgPart::Mention(id) => {
+                                            let name = self.usernames.get(id).cloned().unwrap_or_else(|| format!("id:{id}"));
+                                            let pill = RichText::new(format!("@{name}"))
+                                                .size(self.font_size)
+                                                .strong()
+                                                .color(Color32::from_rgb(201, 205, 251))
+                                                .background_color(Color32::from_rgba_unmultiplied(88, 101, 242, 48));
+                                            ui.label(pill).on_hover_text(format!("<@{id}>"));
+                                        }
+                                        MsgPart::Everyone => {
+                                            ui.label(RichText::new("@everyone")
+                                                .size(self.font_size)
+                                                .strong()
+                                                .color(Color32::WHITE)
+                                                .background_color(Color32::from_rgba_unmultiplied(242, 63, 67, 90)));
+                                        }
+                                        MsgPart::CustomEmoji { name, id, animated } => {
+                                            if !self.emoji_textures.contains_key(id) {
+                                                events::emoji_fetch(id.clone(), *animated, self.tx.clone(), ctx.clone());
+                                            }
+                                            match self.emoji_textures.get(id) {
+                                                Some(tex) => { ui.add(egui::Image::new(tex).max_width(20.0).max_height(20.0)); }
+                                                None => { ui.label(RichText::new(format!(":{name}:")).color(TEXT_MUTE).monospace()); }
+                                            }
+                                        }
+                                    }
+                                    }
+                                });
                                 for url in m.attachment_image_urls() {
                                     draw_media(ui, &mut self.gifs, &url, &self.tx, &ctx, 360.0);
                                 }
@@ -1448,6 +2272,38 @@ impl eframe::App for App {
                                         ui.add(egui::Image::new(tex).max_width(360.0));
                                     }
                                 }
+                                if !m.reactions.is_empty() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for r in &m.reactions {
+                                            let me = r.me;
+                                            let bg = if me { Color32::from_rgba_unmultiplied(88, 101, 242, 60) } else { ROW_SELECTED };
+                                            let fg = if me { Color32::WHITE } else { TEXT };
+                                            let resp = egui::Frame::new()
+                                                .fill(bg)
+                                                .inner_margin(egui::Margin::symmetric(4, 2))
+                                                .corner_radius(10.0)
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        if let Some(id) = &r.emoji.id {
+                                                            if !self.emoji_textures.contains_key(id) {
+                                                                events::emoji_fetch(id.clone(), r.emoji.animated, self.tx.clone(), ctx.clone());
+                                                            }
+                                                            match self.emoji_textures.get(id) {
+                                                                Some(tex) => { ui.add(egui::Image::new(tex).max_width(16.0).max_height(16.0)); }
+                                                                None => { ui.label(RichText::new(format!(":{}:", r.emoji.name)).small().color(fg)); }
+                                                            }
+                                                        } else {
+                                                            ui.label(RichText::new(&r.emoji.name).size(13.0).color(fg));
+                                                        }
+                                                        ui.label(RichText::new(r.count.to_string()).small().color(fg));
+                                                    });
+                                                }).response;
+                                            if resp.clicked() {
+                                                self.toggle_reaction(&m.id, &r.emoji);
+                                            }
+                                        }
+                                    });
+                                }
                                 if !m.attachments.is_empty() {
                                     ui.label(RichText::new(format!("📎 {} ek", m.attachments.len())).small().color(TEXT_MUTE));
                                 }
@@ -1458,6 +2314,22 @@ impl eframe::App for App {
                     }
                 });
 
+            {
+                let typing_names: Vec<String> = self
+                    .typing
+                    .get(sel.as_deref().unwrap_or(""))
+                    .map(|l| l.iter().filter_map(|(uid, _)| self.usernames.get(uid).cloned()).collect())
+                    .unwrap_or_default();
+                let now = std::time::Instant::now();
+                self.typing.retain(|_, l| {
+                    l.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(8));
+                    !l.is_empty()
+                });
+                if !typing_names.is_empty() {
+                    let dots = ".".repeat(((now.elapsed().as_millis() / 400) % 3 + 1) as usize);
+                    ui.label(RichText::new(format!("✏️ {} yazıyor{}", typing_names.join(", "), dots)).small().color(TEXT_MUTE));
+                }
+            }
             if !self.pending_files.is_empty() {
                 ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1474,6 +2346,13 @@ impl eframe::App for App {
             }
             ui.separator();
             ui.horizontal(|ui| {
+                if ui.button("😀").on_hover_text("Emoji").clicked() {
+                    self.reaction_target = None;
+                    self.emoji_modal = !self.emoji_modal;
+                }
+                if ui.button(RichText::new("GIF").color(Color32::WHITE).strong()).on_hover_text("GIF gönder").clicked() {
+                    self.gif_modal = !self.gif_modal;
+                }
                 let resp = ui.add(
                     TextEdit::singleline(&mut self.message_input)
                         .hint_text("Mesaj yaz…")

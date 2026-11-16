@@ -5,6 +5,15 @@ use std::time::Duration;
 const API_BASE: &str = "https://discord.com/api/v10";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct GifItem {
+    pub id: String,
+    pub gif_src: String,
+    pub preview: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub enum LoginResult {
     Token(String),
     Mfa { ticket: String },
@@ -37,6 +46,29 @@ impl RestClient {
             return format!("captcha gerekli (Discord yeni istemcilere zorluk çıkartıyor). Token ile giriş yap.\n{body}");
         }
         format!("http {status}: {}", trunc(&body, 300))
+    }
+
+    pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+        let mut delay = 80u64;
+        for attempt in 0..4 {
+            match self.http.get(url).send() {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        return Err(format!("http {}", resp.status().as_u16()));
+                    }
+                    return resp.bytes().map(|b| b.to_vec()).map_err(|e| format!("bytes: {e}"));
+                }
+                Err(e) => {
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_millis(delay));
+                        delay *= 3;
+                        continue;
+                    }
+                    return Err(format!("ağ hatası: {e}"));
+                }
+            }
+        }
+        unreachable!()
     }
 
     fn retry<F>(&self, build: F) -> Result<reqwest::blocking::Response, String>
@@ -228,6 +260,88 @@ impl RestClient {
         resp.json::<Message>().map_err(|e| e.to_string())
     }
 
+    pub fn trending_gifs(&self, limit: u32) -> Result<Vec<GifItem>, String> {
+        let url = format!("{API_BASE}/gifs/trending-gifs?limit={}&media_format=gif", limit.max(20).min(50));
+        let resp = self.retry(|h| h.get(&url).header("Authorization", &self.token))?;
+        let st = resp.status().as_u16();
+        if !resp.status().is_success() {
+            return Err(Self::err_body(resp, st));
+        }
+        let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+        let arr = body.as_array().ok_or_else(|| "trending yanıtı liste değil".to_string())?;
+        Ok(arr.iter().filter_map(|g| {
+            let gif_src = g.get("gif_src").or_else(|| g.get("src")).and_then(|v| v.as_str())?.to_string();
+            let preview = g.get("preview").and_then(|v| v.as_str()).unwrap_or(&gif_src).to_string();
+            Some(GifItem {
+                id: g.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                gif_src,
+                preview,
+                width: g.get("width").and_then(|v| v.as_u64()).unwrap_or(200) as u32,
+                height: g.get("height").and_then(|v| v.as_u64()).unwrap_or(200) as u32,
+            })
+        }).collect())
+    }
+
+    pub fn gif_search(&self, query: &str, limit: u32) -> Result<Vec<GifItem>, String> {
+        let url = format!("{API_BASE}/gifs/search?q={}&limit={}&media_format=gif", Self::pct(query), limit.max(20).min(50));
+        let resp = self.retry(|h| h.get(&url).header("Authorization", &self.token))?;
+        let st = resp.status().as_u16();
+        if !resp.status().is_success() {
+            return Err(Self::err_body(resp, st));
+        }
+        let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+        let arr = body.as_array().ok_or_else(|| "gif yanıtı liste değil".to_string())?;
+        let out = arr.iter().filter_map(|g| {
+            let gif_src = g.get("gif_src").or_else(|| g.get("src")).and_then(|v| v.as_str())?.to_string();
+            let preview = g.get("preview").and_then(|v| v.as_str()).unwrap_or(&gif_src).to_string();
+            Some(GifItem {
+                id: g.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                gif_src,
+                preview,
+                width: g.get("width").and_then(|v| v.as_u64()).unwrap_or(200) as u32,
+                height: g.get("height").and_then(|v| v.as_u64()).unwrap_or(200) as u32,
+            })
+        }).collect();
+        Ok(out)
+    }
+
+    fn pct(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for b in s.as_bytes() {
+            match *b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    pub fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<(), String> {
+        let e = Self::pct(emoji);
+        let resp = self.retry(|h| {
+            h.put(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{e}/@me"))
+                .header("Authorization", &self.token)
+        })?;
+        if resp.status().as_u16() == 204 {
+            return Ok(());
+        }
+        let st = resp.status().as_u16();
+        Err(Self::err_body(resp, st))
+    }
+
+    pub fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<(), String> {
+        let e = Self::pct(emoji);
+        let resp = self.retry(|h| {
+            h.delete(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{e}/@me"))
+                .header("Authorization", &self.token)
+        })?;
+        if resp.status().as_u16() == 204 {
+            return Ok(());
+        }
+        let st = resp.status().as_u16();
+        Err(Self::err_body(resp, st))
+    }
+
     pub fn open_dm(&self, user_id: &str) -> Result<Channel, String> {
         let resp = self.retry(|h| {
             h.post(format!("{API_BASE}/users/@me/channels"))
@@ -241,22 +355,41 @@ impl RestClient {
         resp.json::<Channel>().map_err(|e| e.to_string())
     }
 
+    pub fn members(&self, guild_id: &str) -> Result<Vec<crate::models::GuildMember>, String> {
+        let resp = self.retry(|h| h.get(format!("{API_BASE}/guilds/{guild_id}/members?limit=1000")).header("Authorization", &self.token))?;
+        let st = resp.status().as_u16();
+        if !resp.status().is_success() {
+            return Err(Self::err_body(resp, st));
+        }
+        resp.json::<Vec<crate::models::GuildMember>>().map_err(|e| e.to_string())
+    }
+
+    pub fn roles(&self, guild_id: &str) -> Result<Vec<crate::models::Role>, String> {
+        let resp = self.retry(|h| h.get(format!("{API_BASE}/guilds/{guild_id}/roles")).header("Authorization", &self.token))?;
+        let st = resp.status().as_u16();
+        if !resp.status().is_success() {
+            return Err(Self::err_body(resp, st));
+        }
+        resp.json::<Vec<crate::models::Role>>().map_err(|e| e.to_string())
+    }
+
+    pub fn emojis(&self, guild_id: &str) -> Result<Vec<crate::models::Emoji>, String> {
+        let resp = self.retry(|h| h.get(format!("{API_BASE}/guilds/{guild_id}/emojis")).header("Authorization", &self.token))?;
+        let st = resp.status().as_u16();
+        if !resp.status().is_success() {
+            return Err(Self::err_body(resp, st));
+        }
+        resp.json::<Vec<crate::models::Emoji>>().map_err(|e| e.to_string())
+    }
+
     pub fn icon_image(&self, guild_id: &str, icon: &str) -> Result<Vec<u8>, String> {
         let url = format!("https://cdn.discordapp.com/icons/{guild_id}/{icon}.png?size=64");
-        let resp = self.http.get(&url).send().map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("icon http {}", resp.status().as_u16()));
-        }
-        resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+        self.get_bytes(&url)
     }
 
     pub fn avatar_image(&self, user_id: &str, avatar: &str) -> Result<Vec<u8>, String> {
         let url = format!("https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png?size=64");
-        let resp = self.http.get(&url).send().map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("avatar http {}", resp.status().as_u16()));
-        }
-        resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+        self.get_bytes(&url)
     }
 }
 

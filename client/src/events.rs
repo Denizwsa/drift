@@ -34,6 +34,16 @@ pub enum UiEvent {
     VideoFrame { id: String, width: u32, height: u32, rgba: Vec<u8> },
     VideoDone { id: String },
     DmOpened { channel: Channel },
+    GuildData { guild_id: String, members: Vec<crate::models::GuildMember>, roles: Vec<crate::models::Role>, emojis: Vec<crate::models::Emoji> },
+    TypingStart { channel_id: String, user_id: String },
+    SpeakingLocal { speaking: bool },
+    SpeakingRemote { ssrc: u32, speaking: bool },
+    VoiceClients { ids: Vec<String> },
+    VoiceSsrcMap { user_id: String, ssrc: u32 },
+    ReactionEvent { channel_id: String, message_id: String, user_id: String, emoji_name: String, emoji_id: Option<String>, add: bool },
+    GifResults { results: Vec<crate::api::GifItem>, query: String },
+    GifSearchFailed { error: String },
+    EmojiTexture { id: String, bytes: Vec<u8> },
 }
 
 #[derive(Clone)]
@@ -53,13 +63,24 @@ pub fn gif_fetch(url: String, tx: std::sync::mpsc::Sender<UiEvent>, ctx: egui::C
                 .user_agent("Mozilla/5.0 (X11; Linux x86_64) DiscordRust/0.1")
                 .build()
                 .map_err(|e| e.to_string())?;
-            let resp = http.get(&url).send().map_err(|e| e.to_string())?;
-            if let Some(len) = resp.content_length() {
+            if let Some(len) = http.get(&url).send().ok().and_then(|r| r.content_length()) {
                 if len > MAX_BYTES {
                     return Err(format!("gif çok büyük ({len} bayt)"));
                 }
             }
-            let bytes = resp.bytes().map_err(|e| e.to_string())?;
+            let bytes = fetch_bytes(&url)?;
+            // GIF değilse statik resmin ilk karesini kullan (png/jpg/webp) — GIF decoder'da patlar
+            if !bytes.starts_with(b"GIF8") {
+                match image::load_from_memory(&bytes) {
+                    Ok(img) => {
+                        let rgba = img.into_rgba8();
+                        let w = rgba.width();
+                        let h = rgba.height();
+                        return Ok(vec![GifFrame { rgba: rgba.into_raw(), width: w, height: h, delay_ms: 3000 }]);
+                    }
+                    Err(e) => return Err(format!("resim decode: {e}")),
+                }
+            }
             use image::AnimationDecoder;
             let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
                 .map_err(|e| format!("gif decoder: {e}"))?;
@@ -181,7 +202,7 @@ pub fn load_guilds(client: RestClient, tx: std::sync::mpsc::Sender<UiEvent>, ctx
                         Ok(bytes) => {
                             let _ = tx.send(UiEvent::GuildIcon { id, bytes });
                         }
-                        Err(e) => { let _ = tx.send(UiEvent::ApiError(format!("icon {e}"))); }
+                        Err(e) => { eprintln!("icon failed: {e}"); }
                     }
                 }
             }
@@ -294,6 +315,81 @@ pub fn video_play(token: String, id: String, url: String, tx: std::sync::mpsc::S
         }
         let _ = child.kill();
         let _ = tx.send(UiEvent::VideoDone { id });
+        ctx.request_repaint();
+    });
+}
+
+fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let mut delay = 60u64;
+    for attempt in 0..3 {
+        match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(12))
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+            .build()
+            .and_then(|h| h.get(url).send())
+        {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    return Err(format!("http {}", resp.status().as_u16()));
+                }
+                return resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string());
+            }
+            Err(e) => {
+                if attempt < 2 { std::thread::sleep(Duration::from_millis(delay)); delay *= 3; continue; }
+                return Err(format!("ağ hatası: {e}"));
+            }
+        }
+    }
+    unreachable!()
+}
+
+pub fn guild_data_fetch(token: String, guild_id: String, tx: std::sync::mpsc::Sender<UiEvent>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let api = match RestClient::new(token) {
+            Ok(a) => a,
+            Err(e) => { let _ = tx.send(UiEvent::ApiError(format!("üyeler: {e}"))); return; }
+        };
+        let members = api.members(&guild_id).unwrap_or_else(|e| { eprintln!("members: {e}"); Vec::new() });
+        let roles = api.roles(&guild_id).unwrap_or_else(|e| { eprintln!("roles: {e}"); Vec::new() });
+        let emojis = api.emojis(&guild_id).unwrap_or_else(|e| { eprintln!("emojis: {e}"); Vec::new() });
+        let _ = tx.send(UiEvent::GuildData { guild_id, members, roles, emojis });
+        ctx.request_repaint();
+    });
+}
+
+pub fn gif_search(token: String, query: String, tx: std::sync::mpsc::Sender<UiEvent>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let result = RestClient::new(token).and_then(|api| api.gif_search(&query, 24));
+        match result {
+            Ok(results) => { let _ = tx.send(UiEvent::GifResults { results, query }); }
+            Err(e) => { let _ = tx.send(UiEvent::GifSearchFailed { error: e }); }
+        }
+        ctx.request_repaint();
+    });
+}
+
+pub fn emoji_fetch(id: String, animated: bool, tx: std::sync::mpsc::Sender<UiEvent>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let url = if animated {
+            format!("https://cdn.discordapp.com/emojis/{id}.gif?size=64")
+        } else {
+            format!("https://cdn.discordapp.com/emojis/{id}.png?size=64")
+        };
+        match fetch_bytes(&url) {
+            Ok(bytes) => { let _ = tx.send(UiEvent::EmojiTexture { id, bytes }); }
+            Err(e) => { eprintln!("emoji fetch: {e}"); }
+        }
+        ctx.request_repaint();
+    });
+}
+
+pub fn trending_gifs(token: String, tx: std::sync::mpsc::Sender<UiEvent>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let result = RestClient::new(token).and_then(|api| api.trending_gifs(24));
+        match result {
+            Ok(results) => { let _ = tx.send(UiEvent::GifResults { results, query: String::new() }); }
+            Err(e) => { let _ = tx.send(UiEvent::GifSearchFailed { error: e }); }
+        }
         ctx.request_repaint();
     });
 }

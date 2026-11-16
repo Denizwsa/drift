@@ -48,6 +48,7 @@ pub struct VoiceServer {
     pub session_id: String,
     pub endpoint: String,
     pub token: String,
+    pub video: bool,
 }
 
 pub fn spawn_voice(cfg: VoiceServer, tx: std::sync::mpsc::Sender<UiEvent>, ctx: egui::Context) {
@@ -332,15 +333,28 @@ async fn voice_loop(cfg: VoiceServer, tx: std::sync::mpsc::Sender<UiEvent>, ctx:
     let _ = tx.send(UiEvent::ApiError(format!("ses: {}'e bağlandı", cfg.endpoint)));
     ctx.request_repaint();
 
-    let identify = serde_json::json!({
-        "op": OP_IDENTIFY,
-        "d": {
-            "server_id": cfg.server_id,
-            "user_id": cfg.user_id,
-            "session_id": cfg.session_id,
-            "token": cfg.token
-        }
-    });
+    let identify = if cfg.video {
+        serde_json::json!({
+            "op": OP_IDENTIFY,
+            "d": {
+                "server_id": cfg.server_id,
+                "user_id": cfg.user_id,
+                "session_id": cfg.session_id,
+                "token": cfg.token,
+                "video": true
+            }
+        })
+    } else {
+        serde_json::json!({
+            "op": OP_IDENTIFY,
+            "d": {
+                "server_id": cfg.server_id,
+                "user_id": cfg.user_id,
+                "session_id": cfg.session_id,
+                "token": cfg.token
+            }
+        })
+    };
     write.send(Message::Text(identify.to_string())).await.map_err(|e| e.to_string())?;
 
     // mikrofon -> tokio mpsc kanalı
@@ -367,6 +381,7 @@ async fn voice_loop(cfg: VoiceServer, tx: std::sync::mpsc::Sender<UiEvent>, ctx:
     let mut opus_in = vec![0i16; FRAME_SAMPLES];
     let mut decoders: HashMap<u32, Decoder> = HashMap::new();
     let mut recv_buf = vec![0u8; 2048];
+    let mut local_speaking = false;
 
     loop {
         tokio::select! {
@@ -448,6 +463,16 @@ async fn voice_loop(cfg: VoiceServer, tx: std::sync::mpsc::Sender<UiEvent>, ctx:
                                 let _ = tx.send(UiEvent::ApiError(format!("ses: session açık — mode={} ssrc={}", media.mode.as_deref().unwrap_or("?"), media.ssrc)));
                                 ctx.request_repaint();
                             }
+                            11 => {
+                                if let Ok(arr) = serde_json::from_value::<Vec<serde_json::Value>>(v["d"]["user_ids"].clone()) {
+                                    let _ = tx.send(UiEvent::VoiceClients { ids: arr.iter().filter_map(|x| x.as_str().map(String::from)).collect() });
+                                }
+                            }
+                            17 => {
+                                if let (Some(uid), Some(ssrc)) = (v["d"]["user_id"].as_str(), v["d"]["ssrc"].as_u64()) {
+                                    let _ = tx.send(UiEvent::VoiceSsrcMap { user_id: uid.to_string(), ssrc: ssrc as u32 });
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -461,6 +486,17 @@ async fn voice_loop(cfg: VoiceServer, tx: std::sync::mpsc::Sender<UiEvent>, ctx:
             }
             maybe_frame = pcm_rx.recv() => {
                 let Some(frame) = maybe_frame else { break; };
+                let sum: f64 = frame.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+                let rms = (sum / frame.len() as f64).sqrt() as f32;
+                let now_speaking = rms > 800.0;
+                if now_speaking != local_speaking {
+                    local_speaking = now_speaking;
+                    let _ = tx.send(UiEvent::SpeakingLocal { speaking: local_speaking });
+                    let _ = write.send(Message::Text(serde_json::json!({
+                        "op": OP_SPEAKING,
+                        "d": { "speaking": if local_speaking { 1 } else { 0 }, "delay": 0, "ssrc": media.ssrc }
+                    }).to_string())).await;
+                }
                 if let (Some(secret), Some(mode)) = (media.secret_key.clone(), media.mode.clone()) {
                     match encoder.encode(&frame, &mut opus_out) {
                         Ok(n) => {
@@ -493,6 +529,10 @@ async fn voice_loop(cfg: VoiceServer, tx: std::sync::mpsc::Sender<UiEvent>, ctx:
                                     let signals = audiopus::MutSignals::try_from(&mut opus_in[..]).expect("mutsignals");
                                     match decoder.decode(packet, signals, false) {
                                         Ok(n) => {
+                                            let rms_sq: f64 = opus_in[..n].iter().map(|s| { let v = *s as f64; v * v }).sum();
+                                            if rms_sq.sqrt() / (n.max(1) as f64) > 250.0 {
+                                                let _ = tx.send(UiEvent::SpeakingRemote { ssrc, speaking: true });
+                                            }
                                             let mut sp = speaker.lock().unwrap();
                                             for s in &opus_in[..n] {
                                                 sp.push_back(*s);

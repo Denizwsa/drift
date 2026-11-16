@@ -125,6 +125,23 @@ impl MessageAuthor {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct Reaction {
+    pub emoji: ReactionEmoji,
+    pub count: u32,
+    #[serde(default)]
+    pub me: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReactionEmoji {
+    pub name: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub animated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct Message {
     pub id: String,
     pub channel_id: String,
@@ -139,6 +156,8 @@ pub struct Message {
     pub attachments: Vec<serde_json::Value>,
     #[serde(default)]
     pub bot: bool,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
 }
 
 impl Message {
@@ -231,4 +250,51 @@ pub struct IdentifyProperties {
     pub client_event_source: Option<String>,
 }
 
-pub const INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
+pub const INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 12) | (1 << 13) | (1 << 15);
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GuildMember {
+    pub user: MemberUser,
+    #[serde(default)]
+    pub nick: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MemberUser {
+    pub id: String,
+    pub username: String,
+    #[serde(default)]
+    pub global_name: Option<String>,
+    #[serde(default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub public_flags: Option<u64>,
+}
+
+impl MemberUser {
+    pub fn display_name(&self) -> String {
+        self.global_name.clone().unwrap_or_else(|| self.username.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Role {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub color: u32,
+    #[serde(default)]
+    pub position: i64,
+    #[serde(default)]
+    pub hoist: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Emoji {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub animated: bool,
+}

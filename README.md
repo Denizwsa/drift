@@ -77,7 +77,8 @@ Drift is **not affiliated with Discord**. Discord is a trademark of Discord Inc.
 
 ## 📄 License
 
-MIT — see [LICENSE](LICENSE).
+[GNU General Public License v3.0](LICENSE) — Drift is copyleft. If we later import any upstream Go Live reference code, its copyright notices and GPL terms travel with it in those files, same as anywhere else.
+
 ---
 <div align="center">
 

@@ -181,6 +181,7 @@ fn try_start_voice(voice: &mut VoiceCapture, tx: &Sender<UiEvent>, ctx: &egui::C
             session_id,
             endpoint,
             token,
+            video: false,
         };
         crate::voice::spawn_voice(cfg, tx.clone(), ctx.clone());
     }
@@ -253,6 +254,33 @@ fn dispatch_frame(
             "STREAM_DELETE" => {
                 if let Some(key) = v["d"]["stream_key"].as_str() {
                     let _ = tx.send(UiEvent::StreamEnded { stream_key: key.to_string() });
+                }
+            }
+            "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
+                let add = t == "MESSAGE_REACTION_ADD";
+                if let (Some(channel_id), Some(message_id), Some(user_id)) = (
+                    v["d"]["channel_id"].as_str(),
+                    v["d"]["message_id"].as_str(),
+                    v["d"]["user_id"].as_str(),
+                ) {
+                    let emoji_name = v["d"]["emoji"]["name"].as_str().unwrap_or("?").to_string();
+                    let emoji_id = v["d"]["emoji"]["id"].as_str().map(String::from);
+                    let _ = tx.send(UiEvent::ReactionEvent {
+                        channel_id: channel_id.to_string(),
+                        message_id: message_id.to_string(),
+                        user_id: user_id.to_string(),
+                        emoji_name,
+                        emoji_id,
+                        add,
+                    });
+                }
+            }
+            "TYPING_START" => {
+                if let (Some(channel_id), Some(user_id)) = (
+                    v["d"]["channel_id"].as_str(),
+                    v["d"]["user_id"].as_str(),
+                ) {
+                    let _ = tx.send(UiEvent::TypingStart { channel_id: channel_id.to_string(), user_id: user_id.to_string() });
                 }
             }
             "VOICE_STATE_UPDATE" => {
